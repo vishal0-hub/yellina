@@ -13,5 +13,10 @@ urlpatterns = [
     path('get_presenter', views.GetPresenterListView.as_view(), name='get-presenter-list'),
     path('get_voice', views.GetVoiceListView.as_view(), name='get-voice-list'),
     path('Webhook', views.WebhookView.as_view(), name='webhook'),
-    path("chat-history/<str:session_id>", views.ChatHistoryView.as_view(), name="chat_history"),  
+    path("chat-history/<str:session_id>", views.ChatHistoryView.as_view(), name="chat_history"),
+    # Interview assistant endpoints
+    path('interview/start', views.InterviewStartView.as_view(), name='interview-start'),
+    path('interview/answer', views.InterviewAnswerView.as_view(), name='interview-answer'),
+    path('interview/summary/<str:session_id>', views.InterviewSummaryView.as_view(), name='interview-summary'),
+    path('interview/analytics', views.InterviewAnalyticsView.as_view(), name='interview-analytics'),
 ]

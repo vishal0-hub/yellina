@@ -1,12 +1,15 @@
 import os
+from datetime import datetime, timedelta
 
 from celery import shared_task
+from celery.schedules import crontab
 from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist
+from django.utils import timezone
 
 from .csv_handler import CSVHandler
 from .embedder import Embedder
-from .models import Agent, UploadedFile
+from .models import Agent, UploadedFile, InterviewSession
 from .pdf_handler import PdfHandler
 
 
@@ -80,3 +83,80 @@ def process_pdf_task(file_id, agent_id):
         print(f"❌ Agent or file not found (agent_id={agent_id}, file_id={file_id})")
     except Exception as e:
         print(f"❌ ERROR: {e}")
+
+
+@shared_task
+def cleanup_expired_interview_sessions():
+    """
+    Clean up expired interview sessions.
+    Runs daily to remove:
+    - Incomplete sessions older than 24 hours
+    - Completed sessions older than 7 days
+    """
+    now = timezone.now()
+    cleanup_count = 0
+
+    # Delete incomplete sessions older than 24 hours
+    incomplete_cutoff = now - timedelta(hours=24)
+    incomplete_sessions = InterviewSession.objects.filter(
+        status='in_progress',
+        created_at__lt=incomplete_cutoff
+    )
+
+    for session in incomplete_sessions:
+        # Delete associated resume file
+        if session.resume_file:
+            try:
+                os.remove(session.resume_file.path)
+            except OSError:
+                pass
+        cleanup_count += 1
+
+    incomplete_deleted = incomplete_sessions.delete()[0]
+
+    # Delete completed sessions older than 7 days
+    completed_cutoff = now - timedelta(days=7)
+    completed_sessions = InterviewSession.objects.filter(
+        status='completed',
+        created_at__lt=completed_cutoff
+    )
+
+    for session in completed_sessions:
+        # Delete associated resume file
+        if session.resume_file:
+            try:
+                os.remove(session.resume_file.path)
+            except OSError:
+                pass
+        cleanup_count += 1
+
+    completed_deleted = completed_sessions.delete()[0]
+
+    print(f"Interview session cleanup: {incomplete_deleted} incomplete, {completed_deleted} completed sessions removed")
+    return f"Cleaned up {cleanup_count} interview sessions"
+
+
+@shared_task
+def mark_abandoned_sessions():
+    """
+    Mark sessions as abandoned if no activity for 2 hours.
+    This runs every hour.
+    """
+    cutoff_time = timezone.now() - timedelta(hours=2)
+
+    # Find sessions that are still in progress but haven't been updated
+    abandoned_sessions = InterviewSession.objects.filter(
+        status='in_progress',
+        updated_at__lt=cutoff_time
+    )
+
+    count = abandoned_sessions.count()
+    if count > 0:
+        # Update status - but need to add 'abandoned' to model choices first
+        for session in abandoned_sessions:
+            session.status = 'abandoned'
+            session.summary = 'Session was abandoned before completion.'
+            session.save()
+
+    print(f"Marked {count} sessions as abandoned")
+    return f"Marked {count} sessions as abandoned"

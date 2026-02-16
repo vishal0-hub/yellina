@@ -2,8 +2,7 @@ from rest_framework import serializers
 from django.contrib.auth.models import User
 from django.contrib.auth.hashers import make_password
 from django.contrib.auth import authenticate
-from .models import UploadedFile
-from .models import Agent, ChatHistory
+from .models import Agent, ChatHistory, InterviewQA, InterviewSession, UploadedFile
 from django.contrib.auth.models import User
 
 
@@ -54,3 +53,35 @@ class ChatHistorySerializer(serializers.ModelSerializer):
     class Meta:
         model = ChatHistory
         fields = [ "user_message", "ai_response", "created_at"]
+
+
+class InterviewStartSerializer(serializers.Serializer):
+    resume = serializers.FileField()
+
+    def validate_resume(self, value):
+        if not value.name.endswith('.pdf'):
+            raise serializers.ValidationError("Only PDF files are accepted.")
+        if value.size > 10 * 1024 * 1024:
+            raise serializers.ValidationError("File size must not exceed 10MB.")
+        return value
+
+
+class InterviewAnswerSerializer(serializers.Serializer):
+    session_id = serializers.UUIDField()
+    answer = serializers.CharField(min_length=1, max_length=5000, required=False)
+    audio = serializers.CharField(required=False)
+
+    def validate(self, data):
+        if not data.get('answer') and not data.get('audio'):
+            raise serializers.ValidationError("Either 'answer' (text) or 'audio' (base64) is required.")
+        if data.get('answer'):
+            data['answer'] = data['answer'].strip()
+            if not data['answer']:
+                raise serializers.ValidationError({"answer": "Answer cannot be empty."})
+        return data
+
+
+class InterviewQASerializer(serializers.ModelSerializer):
+    class Meta:
+        model = InterviewQA
+        fields = ['question_index', 'question', 'answer', 'feedback', 'rating']

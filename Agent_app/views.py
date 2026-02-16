@@ -23,12 +23,21 @@ from rest_framework_simplejwt.tokens import RefreshToken
 
 from .csv_handler import CSVHandler
 from .embedder import Embedder
-from .models import Agent, ChatHistory, UploadedFile
+from .interview_ai import (
+    analyze_answer,
+    generate_interview_questions,
+    generate_summary,
+    speech_to_text,
+    text_to_speech,
+)
+from .models import Agent, ChatHistory, InterviewQA, InterviewSession, UploadedFile
 from .pdf_handler import PdfHandler
 from .serializers import (
     AdminLoginSerializer,
     AgentSummarySerializer,
     ChatHistorySerializer,
+    InterviewAnswerSerializer,
+    InterviewStartSerializer,
     UploadedFileSerializer,
 )
 from .tasks import process_pdf_task
@@ -859,3 +868,447 @@ class ChatHistoryView(APIView):
             return Response(
                 {"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
+
+
+class InterviewStartView(APIView):
+    """
+    POST /api/interview/start
+    Upload a resume PDF and start an interview session.
+
+    Optional authentication can be enabled by setting
+    INTERVIEW_REQUIRES_AUTH = True in settings.
+    """
+    # Uncomment to require authentication
+    # permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        serializer = InterviewStartSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(
+                {"message": "Invalid input", "errors": serializer.errors},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        resume_file = serializer.validated_data["resume"]
+
+        try:
+            # Create session with uploaded file (and user if authenticated)
+            session_data = {'resume_file': resume_file}
+            if request.user and request.user.is_authenticated:
+                session_data['user'] = request.user
+            session = InterviewSession.objects.create(**session_data)
+
+            # Extract text from the uploaded PDF with error handling
+            try:
+                pdf_handler = PdfHandler(session.resume_file.path)
+                resume_text = pdf_handler.extract_full_text()
+            except Exception as pdf_error:
+                session.delete()
+                return Response(
+                    {
+                        "message": "Failed to process PDF file. Please ensure it's a valid, readable PDF.",
+                        "error": str(pdf_error)
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            if not resume_text.strip() or len(resume_text) < 100:
+                session.delete()
+                return Response(
+                    {"message": "Resume content is too short or empty. Please upload a complete resume PDF."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            session.resume_text = resume_text
+
+            # Generate interview questions using Gemini with retry logic
+            max_retries = 3
+            questions = None
+            for attempt in range(max_retries):
+                try:
+                    questions = generate_interview_questions(resume_text)
+                    if questions and len(questions) == 5:
+                        break
+                except Exception as gen_error:
+                    if attempt == max_retries - 1:
+                        session.delete()
+                        return Response(
+                            {
+                                "message": "Failed to generate interview questions. Please try again later.",
+                                "error": str(gen_error)
+                            },
+                            status=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        )
+                    import time
+                    time.sleep(1)  # Brief delay before retry
+
+            session.questions = questions
+            session.save()
+
+            # Create QA entries for all questions
+            for i, question in enumerate(questions):
+                InterviewQA.objects.create(
+                    session=session,
+                    question_index=i,
+                    question=question,
+                )
+
+            # Convert first question to audio
+            question_audio = text_to_speech(questions[0])
+
+            return Response(
+                {
+                    "message": "Interview started successfully",
+                    "session_id": str(session.session_id),
+                    "total_questions": len(questions),
+                    "current_question": 1,
+                    "question": questions[0],
+                    "question_audio": question_audio,
+                },
+                status=status.HTTP_201_CREATED,
+            )
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return Response(
+                {"message": "Failed to start interview session.", "error": str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+
+class InterviewAnswerView(APIView):
+    """
+    POST /api/interview/answer
+    Submit an answer to the current question.
+    Returns feedback, rating, and the next question (or signals completion).
+    """
+
+    def post(self, request):
+        serializer = InterviewAnswerSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(
+                {"message": "Invalid input", "errors": serializer.errors},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        session_id = serializer.validated_data["session_id"]
+        answer_text = serializer.validated_data.get("answer")
+        audio_base64 = serializer.validated_data.get("audio")
+
+        # STT: If audio provided, transcribe it to text
+        if audio_base64 and not answer_text:
+            try:
+                # Validate audio base64 format
+                import base64
+                try:
+                    audio_data = base64.b64decode(audio_base64)
+                    # Check audio size (max 5MB)
+                    if len(audio_data) > 5 * 1024 * 1024:
+                        return Response(
+                            {"message": "Audio file too large. Maximum size is 5MB."},
+                            status=status.HTTP_400_BAD_REQUEST,
+                        )
+                except Exception:
+                    return Response(
+                        {"message": "Invalid audio data format. Expected base64 encoded audio."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+                answer_text = speech_to_text(audio_base64)
+                if not answer_text or len(answer_text.strip()) < 10:
+                    return Response(
+                        {"message": "Could not transcribe audio or answer too short. Please speak clearly and try again."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+            except Exception as e:
+                print(f"STT failed: {e}")
+                return Response(
+                    {"message": "Failed to transcribe audio. Please try text input or record again.", "error": str(e)},
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                )
+
+        try:
+            session = InterviewSession.objects.get(session_id=session_id)
+        except InterviewSession.DoesNotExist:
+            return Response(
+                {"message": "Interview session not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if session.is_completed:
+            return Response(
+                {"message": "This interview session is already completed."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        current_index = session.current_question_index
+
+        if current_index >= session.total_questions:
+            return Response(
+                {"message": "All questions have already been answered."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            # Get the current QA record
+            qa = InterviewQA.objects.get(
+                session=session, question_index=current_index
+            )
+
+            # Analyze the answer using Gemini
+            analysis = analyze_answer(
+                question=qa.question,
+                answer=answer_text,
+                resume_text=session.resume_text,
+            )
+
+            # Save the answer and analysis
+            qa.answer = answer_text
+            qa.feedback = analysis["feedback"]
+            qa.rating = analysis["rating"]
+            qa.save()
+
+            # Advance the question index
+            session.current_question_index = current_index + 1
+
+            is_last_question = (current_index + 1) >= session.total_questions
+
+            if is_last_question:
+                # Generate the overall summary
+                all_qa = InterviewQA.objects.filter(session=session).order_by(
+                    "question_index"
+                )
+                qa_data = [
+                    {
+                        "question": q.question,
+                        "answer": q.answer,
+                        "feedback": q.feedback,
+                        "rating": q.rating,
+                    }
+                    for q in all_qa
+                ]
+
+                summary = generate_summary(qa_data, session.resume_text)
+                session.summary = summary
+                session.status = "completed"
+                session.save()
+
+                # TTS: Convert feedback to audio
+                feedback_audio = text_to_speech(analysis["feedback"])
+
+                return Response(
+                    {
+                        "message": "Interview completed!",
+                        "session_id": str(session.session_id),
+                        "current_question": current_index + 1,
+                        "total_questions": session.total_questions,
+                        "transcribed_answer": answer_text,
+                        "feedback": analysis["feedback"],
+                        "feedback_audio": feedback_audio,
+                        "rating": analysis["rating"],
+                        "is_complete": True,
+                        "next_question": None,
+                        "next_question_audio": None,
+                    },
+                    status=status.HTTP_200_OK,
+                )
+            else:
+                next_question = session.questions[current_index + 1]
+                session.save()
+
+                # TTS: Convert feedback + next question to audio
+                feedback_audio = text_to_speech(analysis["feedback"])
+                next_question_audio = text_to_speech(next_question)
+
+                return Response(
+                    {
+                        "message": "Answer recorded successfully",
+                        "session_id": str(session.session_id),
+                        "current_question": current_index + 1,
+                        "total_questions": session.total_questions,
+                        "transcribed_answer": answer_text,
+                        "feedback": analysis["feedback"],
+                        "feedback_audio": feedback_audio,
+                        "rating": analysis["rating"],
+                        "is_complete": False,
+                        "next_question": next_question,
+                        "next_question_audio": next_question_audio,
+                        "next_question_number": current_index + 2,
+                    },
+                    status=status.HTTP_200_OK,
+                )
+
+        except Exception as e:
+            print(f"Error processing answer: {e}")
+            return Response(
+                {"message": "Failed to process answer."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+
+class InterviewSummaryView(APIView):
+    """
+    GET /api/interview/summary/<session_id>
+    Get the overall interview summary with all Q&A pairs, feedback, and ratings.
+    """
+
+    def get(self, request, session_id):
+        try:
+            session = InterviewSession.objects.get(session_id=session_id)
+        except (InterviewSession.DoesNotExist, ValueError):
+            return Response(
+                {"message": "Interview session not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        all_qa = InterviewQA.objects.filter(session=session).order_by("question_index")
+
+        qa_data = [
+            {
+                "question_number": qa.question_index + 1,
+                "question": qa.question,
+                "answer": qa.answer,
+                "feedback": qa.feedback,
+                "rating": qa.rating,
+            }
+            for qa in all_qa
+        ]
+
+        ratings = [qa.rating for qa in all_qa if qa.rating is not None]
+        avg_rating = round(sum(ratings) / len(ratings), 1) if ratings else 0
+
+        if not session.is_completed:
+            return Response(
+                {
+                    "session_id": str(session.session_id),
+                    "status": session.status,
+                    "current_question": session.current_question_index,
+                    "total_questions": session.total_questions,
+                    "message": "Interview is still in progress.",
+                    "average_rating": avg_rating,
+                    "qa_pairs": qa_data,
+                    "summary": None,
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        return Response(
+            {
+                "session_id": str(session.session_id),
+                "status": session.status,
+                "total_questions": session.total_questions,
+                "average_rating": avg_rating,
+                "qa_pairs": qa_data,
+                "summary": session.summary,
+                "created_at": session.created_at,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class InterviewAnalyticsView(APIView):
+    """
+    GET /api/interview/analytics
+    Get analytics and insights about interview performance.
+    Optionally filter by user if authenticated.
+    """
+
+    def get(self, request):
+        from django.db.models import Avg, Count, Q
+
+        # Base queryset
+        sessions_query = InterviewSession.objects.all()
+
+        # Filter by authenticated user if applicable
+        if request.user and request.user.is_authenticated:
+            user_filter = request.query_params.get('user_only', 'false').lower() == 'true'
+            if user_filter:
+                sessions_query = sessions_query.filter(user=request.user)
+
+        # Date range filtering
+        from_date = request.query_params.get('from_date')
+        to_date = request.query_params.get('to_date')
+
+        if from_date:
+            sessions_query = sessions_query.filter(created_at__gte=from_date)
+        if to_date:
+            sessions_query = sessions_query.filter(created_at__lte=to_date)
+
+        # Calculate metrics
+        total_sessions = sessions_query.count()
+        completed_sessions = sessions_query.filter(status='completed').count()
+        abandoned_sessions = sessions_query.filter(status='abandoned').count()
+        in_progress_sessions = sessions_query.filter(status='in_progress').count()
+
+        # Average ratings
+        avg_rating = InterviewQA.objects.filter(
+            session__in=sessions_query,
+            rating__isnull=False
+        ).aggregate(avg=Avg('rating'))['avg'] or 0
+
+        # Question-wise performance
+        question_stats = []
+        for i in range(5):  # Assuming 5 questions
+            q_stats = InterviewQA.objects.filter(
+                session__in=sessions_query,
+                question_index=i,
+                rating__isnull=False
+            ).aggregate(
+                avg_rating=Avg('rating'),
+                total_answered=Count('id')
+            )
+            question_stats.append({
+                'question_number': i + 1,
+                'avg_rating': round(q_stats['avg_rating'] or 0, 1),
+                'total_answered': q_stats['total_answered']
+            })
+
+        # Completion rate
+        completion_rate = (completed_sessions / total_sessions * 100) if total_sessions > 0 else 0
+
+        # Rating distribution
+        rating_distribution = {}
+        for rating in range(1, 11):
+            count = InterviewQA.objects.filter(
+                session__in=sessions_query,
+                rating=rating
+            ).count()
+            rating_distribution[str(rating)] = count
+
+        # Recent sessions
+        recent_sessions = []
+        for session in sessions_query.order_by('-created_at')[:10]:
+            qa_data = InterviewQA.objects.filter(
+                session=session,
+                rating__isnull=False
+            ).aggregate(avg=Avg('rating'))
+
+            recent_sessions.append({
+                'session_id': str(session.session_id),
+                'status': session.status,
+                'avg_rating': round(qa_data['avg'] or 0, 1),
+                'created_at': session.created_at.isoformat(),
+                'user': session.user.username if session.user else 'Anonymous'
+            })
+
+        analytics = {
+            'summary': {
+                'total_sessions': total_sessions,
+                'completed_sessions': completed_sessions,
+                'abandoned_sessions': abandoned_sessions,
+                'in_progress_sessions': in_progress_sessions,
+                'completion_rate': round(completion_rate, 1),
+                'overall_avg_rating': round(avg_rating, 1)
+            },
+            'question_performance': question_stats,
+            'rating_distribution': rating_distribution,
+            'recent_sessions': recent_sessions,
+            'filters_applied': {
+                'from_date': from_date,
+                'to_date': to_date,
+                'user_only': request.query_params.get('user_only', 'false')
+            }
+        }
+
+        return Response(analytics, status=status.HTTP_200_OK)

@@ -1,3 +1,5 @@
+import uuid
+
 from django.db import models
 
 
@@ -35,6 +37,60 @@ class ChatHistory(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
 
+class InterviewSession(models.Model):
+    STATUS_CHOICES = [
+        ('in_progress', 'In Progress'),
+        ('completed', 'Completed'),
+        ('abandoned', 'Abandoned'),
+    ]
+
+    session_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    user = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='interview_sessions',
+        help_text='User who created this interview session (if authenticated)'
+    )
+    resume_file = models.FileField(upload_to='interview_resumes/')
+    resume_text = models.TextField(blank=True, default='')
+    questions = models.JSONField(default=list)
+    current_question_index = models.IntegerField(default=0)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='in_progress')
+    summary = models.TextField(blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"Interview {self.session_id} - {self.status}"
+
+    @property
+    def total_questions(self):
+        return len(self.questions)
+
+    @property
+    def is_completed(self):
+        return self.status == 'completed'
 
 
+class InterviewQA(models.Model):
+    session = models.ForeignKey(
+        InterviewSession,
+        on_delete=models.CASCADE,
+        related_name='qa_pairs',
+    )
+    question_index = models.IntegerField()
+    question = models.TextField()
+    answer = models.TextField(blank=True, default='')
+    feedback = models.TextField(blank=True, default='')
+    rating = models.IntegerField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['question_index']
+        unique_together = ['session', 'question_index']
+
+    def __str__(self):
+        return f"Q{self.question_index + 1} for {self.session.session_id}"
 

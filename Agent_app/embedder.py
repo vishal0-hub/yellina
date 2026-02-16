@@ -8,8 +8,14 @@ import spacy
 
 nlp = spacy.load("it_core_news_sm")
 
-# Gemini Embeddings
-embedder = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+# Gemini Embeddings (lazy-loaded to avoid blocking server startup)
+_embedder = None
+
+def get_embedder():
+    global _embedder
+    if _embedder is None:
+        _embedder = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+    return _embedder
 
 class Embedder:
     def __init__(self, index_path=None, ftype="pdf"):
@@ -56,7 +62,7 @@ class Embedder:
                 return "No documents to index"
             
             
-            self.index = FAISS.from_documents(self.docs, embedder)
+            self.index = FAISS.from_documents(self.docs, get_embedder())
             self.index.save_local(self.index_path)
             print(f"Index created and saved to {self.index_path}")
 
@@ -74,7 +80,7 @@ class Embedder:
             if not os.path.exists(self.index_path):
                 raise FileNotFoundError(f"⚠️ No index found at {self.index_path}")
             
-            self.index = FAISS.load_local(self.index_path, embedder, allow_dangerous_deserialization=True)
+            self.index = FAISS.load_local(self.index_path, get_embedder(), allow_dangerous_deserialization=True)
             print("Index loaded successfully")
             return True
         
@@ -146,7 +152,7 @@ class Embedder:
         remaining_docs = [doc for doc in self.index.docstore._dict.values() if doc.metadata["book"] != book_name]
 
         # rebuild FAISS index
-        self.index = FAISS.from_documents(remaining_docs, embedder)
+        self.index = FAISS.from_documents(remaining_docs, get_embedder())
         self.index.save_local(self.index_path)
         return f"Book '{book_name}' removed from index"
 
