@@ -1,0 +1,32 @@
+#  add venv file
+.venv
+
+#  add env file
+.env
+
+#  add  db file
+db.sqlite3
+
+#  add migrations folder
+migrations/
+
+#  add pycache files
+__pycache__/
+
+#  medial files
+media/
+
+.vscode/
+
+*.html
+
+*.js
+
+create*
+
+demo*
+
+#  add the  index to  git ignore
+*_faiss_index
+
+*.json
