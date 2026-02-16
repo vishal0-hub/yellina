@@ -11,9 +11,7 @@ from django.conf import settings
 from django.db import transaction
 from dotenv import load_dotenv
 from langchain.chains import RetrievalQA
-from langchain.chat_models import ChatOpenAI
-from langchain.document_loaders import PyPDFLoader
-from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain.text_splitter import CharacterTextSplitter
 from langchain.vectorstores import FAISS
 from openai import OpenAI
@@ -605,13 +603,13 @@ class VoiceQueryAPIView(APIView):
             texts = text_splitter.split_documents(pages)
 
             # Embedding and FAISS vector store
-            embeddings = OpenAIEmbeddings()
+            embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
             vectordb = FAISS.from_documents(texts, embeddings)
 
             print(vectordb.as_retriever(), "vectordb.as_retriever()--->>>")
 
-            # Use ChatOpenAI for LangChain
-            llm = ChatOpenAI(model="gpt-3.5-turbo")  # Uses OPENAI_API_KEY from env
+            # Use Gemini for LangChain
+            llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash")
 
             # RetrievalQA chain
             qa_chain = RetrievalQA.from_chain_type(

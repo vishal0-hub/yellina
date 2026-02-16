@@ -16,7 +16,7 @@ from langchain.text_splitter import CharacterTextSplitter, RecursiveCharacterTex
 from langchain.embeddings.openai import OpenAIEmbeddings
 from langchain.vectorstores import FAISS
 from langchain.chains import RetrievalQA
-from langchain.chat_models import ChatOpenAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 from openai import OpenAI
 import tempfile
 import  requests
@@ -61,6 +61,10 @@ class DIDProxyConsumer(AsyncWebsocketConsumer):
         await self.accept() 
         self.stream_id=None
         self.conversation_history = []
+        self.interview_questions = []
+        self.current_question_index = 0
+        self.interview_responses = []
+        self.is_interview_mode = False
         print('self. converstin history--->>', self.conversation_history)
 
         
@@ -128,9 +132,20 @@ class DIDProxyConsumer(AsyncWebsocketConsumer):
         if  "programm" in  self.category.lower():
              for doc in self.embeder.index.docstore._dict.values():
                   self.retrived_data.append(doc.page_content)
-                #   print(doc.document)
+        
+        # Check for Interview Mode
+        if "interview" in self.category.lower():
+            self.is_interview_mode = True
+            print("Interview mode detected. Generating questions from resume...")
+            resume_text = ""
+            if self.embeder.index:
+                for doc in self.embeder.index.docstore._dict.values():
+                    resume_text += doc.page_content + "\n"
             
-            #  get all the documeted data
+            if resume_text:
+                self.interview_questions = await self.generate_interview_questions(resume_text)
+                print(f"Generated {len(self.interview_questions)} questions.")
+
         print(self.retrived_data,'\n\n\n----->>>>>>>datat')
 
 
@@ -216,8 +231,7 @@ Final Answer:
         # )
 
 
-        llm = ChatOpenAI(model="gpt-4.1-mini")
-        # llm = ChatOpenAI(model="gpt-4.1")
+        llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash")
 
         self.qa_chain = LLMChain(
             llm=llm,
@@ -286,13 +300,32 @@ Final Answer:
 
                 
 
-                # Run QA
-                raw_answer = self.qa_chain.run(question=user_question, context = retrieved_docs, chat_history=self.conversation_history, datetime=datetime.datetime.now().strftime("%d-%m-%Y %H:%M:%S"))
-
-                print('raw answer--->>>', raw_answer)
-
-                answer=self.validate_answer(user_question, raw_answer)
-
+                # Interview Mode logic
+                if self.is_interview_mode:
+                    if self.current_question_index < len(self.interview_questions):
+                        # Store response for previous question (if not first)
+                        if self.current_question_index > 0:
+                            self.interview_responses.append({"question": self.interview_questions[self.current_question_index-1], "answer": user_question})
+                        
+                        # Get next question
+                        answer = self.interview_questions[self.current_question_index]
+                        self.current_question_index += 1
+                        
+                        # If session just ended with the last question being answered
+                        if self.current_question_index == len(self.interview_questions):
+                             # This was the last question being asked, we still need to wait for the final answer
+                             pass
+                    else:
+                        # Final evaluation
+                        self.interview_responses.append({"question": self.interview_questions[-1], "answer": user_question})
+                        evaluation = await self.evaluate_interview()
+                        answer = evaluation
+                        self.is_interview_mode = False # End interview
+                else:
+                    # Run QA (Standard mode)
+                    raw_answer = self.qa_chain.run(question=user_question, context = retrieved_docs, chat_history=self.conversation_history, datetime=datetime.datetime.now().strftime("%d-%m-%Y %H:%M:%S"))
+                    print('raw answer--->>>', raw_answer)
+                    answer=self.validate_answer(user_question, raw_answer)
 
                 self.conversation_history.append(f"Doctor: {user_question}")
                 self.conversation_history.append(f"Assistant: {answer}")
@@ -357,7 +390,7 @@ Final Answer:
         """
         try:
             # create the  client to check the  resposne validity  by  open ai
-            openai_client = OpenAI()  # Reads key from env (OPENAI_API_KEY)
+            llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash")
             validation_prompt = f"""Check the following answer for factual accuracy and relevance to the question asked. You  have to check the answer and  remove the  all the gramatic error, vocabulary issues, and ensure clarity.Some rules to  validate the answer are  given below:
 
             ## key points:
@@ -370,15 +403,12 @@ Final Answer:
             - Ensure titles retain correct number (singular/plural) and gender agreement (e.g., “Cataratte complicate” not “Cataratta complicato”).
             \n\nQuestion: {question}\n\nAnswer: {answer} """
 
-            validation_response = openai_client.chat.completions.create(
-                model="gpt-4.1",
-                messages=[
-                    {"role": "system", "content": f"You are  answer validator with  30  years of the experice. you are expert in {self.language}. You  taks is to remove te gramtic error from the answer , ensure the clarity and provide only the  correct answer nothing else."},
-                    {"role": "user", "content": validation_prompt}
-                ]
-            )
+            validation_response = llm.invoke([
+                {"role": "system", "content": f"You are  answer validator with  30  years of the experice. you are expert in {self.language}. You  taks is to remove te gramtic error from the answer , ensure the clarity and provide only the  correct answer nothing else."},
+                {"role": "user", "content": validation_prompt}
+            ])
 
-            f_answer = validation_response.choices[0].message.content.strip()
+            f_answer = validation_response.content.strip()
             print("Validation response:", f_answer)
             return f_answer
             
@@ -620,7 +650,7 @@ Final Answer:
                     prompt=prompt,
                     n=1,
                     # size="1024x1024",
-                    response_format="url"
+                    # response_format="url"
                 )
 
                 # image_bytes = base64.b64decode(img.data[0].b64_json)
@@ -634,3 +664,32 @@ Final Answer:
         except Exception as e:
             print('exception in  generate image:', e)
             return None
+
+    async def generate_interview_questions(self, resume_text):
+        """Generates 5 interview questions based on the resume."""
+        try:
+            llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash")
+            prompt = f"Based on the following resume text, generate 5 technical and behavioral interview questions. Return ONLY the questions as a JSON list of strings.\n\nResume:\n{resume_text}"
+            response = await llm.ainvoke(prompt)
+            # Find the JSON part
+            content = response.content
+            match = re.search(r"\[.*\]", content, re.DOTALL)
+            if match:
+                questions = json.loads(match.group(0))
+                return questions
+            return ["Tell me about yourself.", "What are your core strengths?", "Describe a difficult project you worked on.", "Where do you see yourself in 5 years?", "Why should we hire you?"]
+        except Exception as e:
+            print(f"Error generating questions: {e}")
+            return ["Tell me about yourself.", "What are your core strengths?", "Describe a difficult project you worked on.", "Where do you see yourself in 5 years?", "Why should we hire you?"]
+
+    async def evaluate_interview(self):
+        """Evaluates the interview based on responses."""
+        try:
+            llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash")
+            chat_summary = "\n".join([f"Q: {r['question']}\nA: {r['answer']}" for r in self.interview_responses])
+            prompt = f"Analyze the following interview session and provide a rating and accuracy analysis for the candidate's answers. Be professional and constructive.\n\nSession:\n{chat_summary}"
+            response = await llm.ainvoke(prompt)
+            return response.content
+        except Exception as e:
+            print(f"Error evaluating interview: {e}")
+            return "Thank you for the interview. We will analyze your responses and get back to you with a rating."

@@ -1,5 +1,5 @@
 from langchain.vectorstores import FAISS
-from langchain.embeddings import HuggingFaceEmbeddings
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain.docstore.document import Document
 import os
 from sentence_transformers import SentenceTransformer
@@ -8,15 +8,8 @@ import spacy
 
 nlp = spacy.load("it_core_news_sm")
 
-#  old embeder
-# embedder = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-
-#new multilingual embeder
-# embedder  = HuggingFaceEmbeddings(model_name="sentence-transformers/paraphrase-multilingual-mpnet-base-v2")
-embedder = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
-    encode_kwargs={'normalize_embeddings': True}  # Normalize embeddings to unit length
-)
+# Gemini Embeddings
+embedder = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
 
 class Embedder:
     def __init__(self, index_path=None, ftype="pdf"):

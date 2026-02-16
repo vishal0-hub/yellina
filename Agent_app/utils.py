@@ -6,11 +6,11 @@ import time
 
 load_dotenv()
 
-DID_KEY = os.getenv("D_ID_KEY")
+# DID_KEY = os.getenv("D_ID_KEY")
 
 
 # Encode the "username:apikey" string to Base64
-did_key_encoded = base64.b64encode(DID_KEY.encode("utf-8")).decode("utf-8")
+# did_key_encoded = base64.b64encode(DID_KEY.encode("utf-8")).decode("utf-8")
 
 #  function to generate the  video by the D-ID
 def generate_video_from_did(image_url=None, text="Making videos is easy with D-ID", agent_name=None):
